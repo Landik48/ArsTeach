@@ -1,0 +1,57 @@
+# Caddy для продакшена: https://{$DOMAIN}
+#
+# Используется только в профиле prod: монтируется в сервис caddy
+# (docker-compose.yaml). Образ сервиса собирается из frontend/Dockerfile
+# (таргет prod) и уже содержит статику мини-аппа в /srv.
+#
+# Caddy сам получает и продлевает сертификат Let's Encrypt. Этого достаточно
+# для требований MAX к вебхуку: HTTPS, порт 443, доверенный УЦ, полная цепочка.
+# Условие: DNS-запись домена указывает на сервер, порты 80 и 443 открыты.
+{
+	email {$ACME_EMAIL}
+}
+
+{$DOMAIN} {
+	encode zstd gzip
+
+	# --- API мини-аппа ---
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	# --- Вебхук бота: MAX шлёт сюда апдейты ---
+	handle /max/webhook {
+		reverse_proxy api:8000
+	}
+
+	# --- Статика мини-аппа (собрана Vite в frontend/Dockerfile, лежит в /srv) ---
+	handle {
+		root * /srv
+
+		# Файлы в /assets/ с хешем в имени — кешируем навсегда
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+
+		# index.html и остальное — без кеша, чтобы новый релиз подхватывался сразу
+		@notAssets not path /assets/*
+		header @notAssets Cache-Control "no-cache"
+
+		# SPA: неизвестный путь отдаёт index.html
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+		# ВНИМАНИЕ: не ставьте X-Frame-Options DENY и CSP frame-ancestors 'none':
+		# веб-версия MAX может показывать мини-апп во фрейме
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

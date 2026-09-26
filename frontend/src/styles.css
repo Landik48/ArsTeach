@@ -1,0 +1,33 @@
+/* Минимум своих стилей: всё остальное даёт MAX UI (токены, темы, платформы) */
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+.screen {
+  /* Панель на весь экран: dvh учитывает выезжающие панели мобильного WebView */
+  min-height: 100vh;
+  min-height: 100dvh;
+  box-sizing: border-box;
+  /* Отступы с учётом безопасных зон (вырез камеры, home-индикатор) */
+  padding: max(16px, env(safe-area-inset-top)) 0 max(16px, env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.hero {
+  padding-top: 8px;
+  text-align: center;
+}
+
+.actions {
+  padding: 0 16px;
+}
+
+.status {
+  text-align: center;
+}

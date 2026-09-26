@@ -1,0 +1,178 @@
+# Docker Compose с двумя профилями:
+#
+#   dev  — docker compose --profile dev up --build
+#          http://localhost:5173, hot reload фронта и бэка, бот через long polling
+#
+#   prod — docker compose --profile prod up -d --build
+#          https://$DOMAIN, статика в Caddy, бот через вебхук
+#
+# База (db) без профиля — она нужна в обоих режимах и стартует всегда.
+# Все переменные — в .env (скопируйте из .env.example).
+
+name: max-app
+
+# ---------------------------------------------------------------------------
+# Общие куски конфигурации (YAML-якоря)
+# ---------------------------------------------------------------------------
+x-backend-env: &backend-env
+  env_file: .env
+  restart: unless-stopped
+
+x-depends-db: &depends-db
+  db:
+    condition: service_healthy
+
+x-backend-dev: &backend-dev
+  <<: *backend-env
+  build:
+    context: ./backend
+    target: dev
+    # args:
+    #   INSTALL_RU_CA: "true"   # сертификаты Минцифры, см. backend/Dockerfile
+  image: max-app/backend:dev
+  environment:
+    APP_ENV: dev
+    BOT_MODE: polling
+  volumes:
+    # Исходники с хоста: правки подхватываются без пересборки образа
+    - ./backend:/app
+
+x-backend-prod: &backend-prod
+  <<: *backend-env
+  build:
+    context: ./backend
+    target: prod
+    # args:
+    #   INSTALL_RU_CA: "true"
+  image: max-app/backend:prod
+  environment:
+    APP_ENV: prod
+    BOT_MODE: webhook
+
+services:
+  # =========================================================================
+  # PostgreSQL — общий для dev и prod
+  # =========================================================================
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    env_file: .env # берёт POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB
+    volumes:
+      # С Postgres 18 том монтируется в /var/lib/postgresql (не в .../data):
+      # данные лежат в подпапке версии, это упрощает pg_upgrade
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # =========================================================================
+  # DEV
+  # =========================================================================
+  migrate-dev:
+    <<: *backend-dev
+    profiles: [dev]
+    command: alembic upgrade head
+    restart: "no"
+    depends_on: *depends-db
+
+  api-dev:
+    <<: *backend-dev
+    profiles: [dev]
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      # Swagger и API напрямую: http://localhost:8000/api/docs (только с localhost)
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      <<: *depends-db
+      migrate-dev:
+        condition: service_completed_successfully
+
+  bot-dev:
+    <<: *backend-dev
+    profiles: [dev]
+    # watchfiles перезапускает бота при изменении .py-файлов (аналог --reload)
+    command: watchfiles --filter python "python -m app.bot.polling" app
+    # Без токена процесс штатно завершается — не перезапускаем его по кругу
+    restart: "no"
+    depends_on:
+      <<: *depends-db
+      migrate-dev:
+        condition: service_completed_successfully
+
+  web-dev:
+    build:
+      context: ./frontend
+      target: dev
+    image: max-app/web:dev
+    profiles: [dev]
+    environment:
+      # Vite проксирует /api на бэкенд (см. frontend/vite.config.ts)
+      VITE_API_PROXY: http://api-dev:8000
+    ports:
+      # Мини-апп: http://localhost:5173. Туннель для открытия внутри MAX — сюда же
+      - "5173:5173"
+    volumes:
+      - ./frontend:/web
+      # node_modules в именованном томе: не смешиваем пакеты хоста и контейнера
+      - web-node-modules:/web/node_modules
+    depends_on: [api-dev]
+    restart: unless-stopped
+
+  # Доступ к базе с хоста (DBeaver, psql) только в dev и только с localhost
+  db-port-dev:
+    image: alpine/socat
+    profiles: [dev]
+    command: tcp-listen:5432,fork,reuseaddr tcp-connect:db:5432
+    ports:
+      - "127.0.0.1:5432:5432"
+    depends_on: *depends-db
+    restart: unless-stopped
+
+  # =========================================================================
+  # PROD
+  # =========================================================================
+  migrate:
+    <<: *backend-prod
+    profiles: [prod]
+    command: alembic upgrade head
+    restart: "no"
+    depends_on: *depends-db
+
+  api:
+    <<: *backend-prod
+    profiles: [prod]
+    depends_on:
+      <<: *depends-db
+      migrate:
+        condition: service_completed_successfully
+
+  # Точка входа в prod: статика мини-аппа + прокси /api и /max/webhook + HTTPS.
+  # Образ — frontend/Dockerfile (таргет prod: сборка Vite → Caddy), конфиг — ./Caddyfile
+  caddy:
+    profiles: [prod]
+    build:
+      context: ./frontend
+      target: prod
+      # args:
+      #   VITE_ENABLE_ERUDA: "true"   # консоль eruda в prod-сборке для отладки на телефоне
+    image: max-app/web:prod
+    env_file: .env # DOMAIN, ACME_EMAIL
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Сертификаты Let's Encrypt — обязательно в томе, иначе упрётесь в лимиты выпуска
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [api]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  web-node-modules:
+  caddy-data:
+  caddy-config:
